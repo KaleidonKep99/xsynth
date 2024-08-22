@@ -1,4 +1,4 @@
-use crate::voice::VoiceControlData;
+use crate::voice::{ReleaseType, VoiceControlData};
 
 use super::{Voice, VoiceGeneratorBase, VoiceSampleGenerator};
 
@@ -6,14 +6,16 @@ use super::{Voice, VoiceGeneratorBase, VoiceSampleGenerator};
 pub struct VoiceBase<T: Send + Sync + VoiceSampleGenerator> {
     sample_generator: T,
     releasing: bool,
+    killed: bool,
     velocity: u8,
 }
 
 impl<T: Send + Sync + VoiceSampleGenerator> VoiceBase<T> {
     pub fn new(velocity: u8, sample_generator: T) -> VoiceBase<T> {
         VoiceBase {
-            sample_generator: sample_generator,
+            sample_generator,
             releasing: false,
+            killed: false,
             velocity,
         }
     }
@@ -29,11 +31,15 @@ where
     }
 
     #[inline(always)]
-    fn signal_release(&mut self) {
-        self.releasing = true;
-        self.sample_generator.signal_release()
+    fn signal_release(&mut self, rel_type: ReleaseType) {
+        match rel_type {
+            ReleaseType::Standard => self.releasing = true,
+            ReleaseType::Kill => self.killed = true,
+        }
+        self.sample_generator.signal_release(rel_type)
     }
 
+    #[inline(always)]
     fn process_controls(&mut self, control: &VoiceControlData) {
         self.sample_generator.process_controls(control)
     }
@@ -56,6 +62,11 @@ where
     #[inline(always)]
     fn is_releasing(&self) -> bool {
         self.releasing
+    }
+
+    #[inline(always)]
+    fn is_killed(&self) -> bool {
+        self.killed
     }
 
     #[inline(always)]

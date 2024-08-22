@@ -4,7 +4,8 @@ use std::sync::{
 };
 
 use super::{
-    channel_sf::ChannelSoundfont, event::NoteEvent, voice_buffer::VoiceBuffer, VoiceControlData,
+    channel_sf::ChannelSoundfont, event::KeyNoteEvent, voice_buffer::VoiceBuffer,
+    ChannelInitOptions, VoiceControlData,
 };
 
 pub struct KeyData {
@@ -15,10 +16,14 @@ pub struct KeyData {
 }
 
 impl KeyData {
-    pub fn new(key: u8, shared_voice_counter: Arc<AtomicU64>) -> KeyData {
+    pub fn new(
+        key: u8,
+        shared_voice_counter: Arc<AtomicU64>,
+        options: ChannelInitOptions,
+    ) -> KeyData {
         KeyData {
             key,
-            voices: VoiceBuffer::new(),
+            voices: VoiceBuffer::new(options),
             last_voice_count: 0,
             shared_voice_counter,
         }
@@ -26,22 +31,31 @@ impl KeyData {
 
     pub fn send_event(
         &mut self,
-        event: NoteEvent,
+        event: KeyNoteEvent,
         control: &VoiceControlData,
         channel_sf: &ChannelSoundfont,
         max_layers: Option<usize>,
     ) {
         match event {
-            NoteEvent::On(vel) => {
+            KeyNoteEvent::On(vel) => {
                 let voices = channel_sf.spawn_voices_attack(control, self.key, vel);
-                self.voices.push_voices(vel, voices, max_layers);
+                self.voices.push_voices(voices, max_layers);
             }
-            NoteEvent::Off => {
+            KeyNoteEvent::Off => {
                 let vel = self.voices.release_next_voice();
                 if let Some(vel) = vel {
                     let voices = channel_sf.spawn_voices_release(control, self.key, vel);
-                    self.voices.push_voices(vel, voices, max_layers);
+                    self.voices.push_voices(voices, max_layers);
                 }
+            }
+            KeyNoteEvent::AllOff => {
+                while let Some(vel) = self.voices.release_next_voice() {
+                    let voices = channel_sf.spawn_voices_release(control, self.key, vel);
+                    self.voices.push_voices(voices, max_layers);
+                }
+            }
+            KeyNoteEvent::AllKilled => {
+                self.voices.kill_all_voices();
             }
         }
     }
@@ -56,6 +70,7 @@ impl KeyData {
         if !self.has_voices() {
             return;
         }
+
         for voice in &mut self.voices.iter_voices_mut() {
             voice.render_to(out);
         }
@@ -75,5 +90,9 @@ impl KeyData {
 
     pub fn has_voices(&self) -> bool {
         self.voices.has_voices()
+    }
+
+    pub fn set_damper(&mut self, damper: bool) {
+        self.voices.set_damper(damper);
     }
 }

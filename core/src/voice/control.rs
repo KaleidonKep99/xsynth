@@ -1,6 +1,6 @@
-use simdeez::Simd;
+use simdeez::prelude::*;
 
-use crate::voice::VoiceControlData;
+use crate::voice::{ReleaseType, VoiceControlData};
 
 use super::{SIMDSampleMono, SIMDVoiceGenerator, VoiceGeneratorBase};
 
@@ -14,30 +14,34 @@ impl<S: Simd> SIMDVoiceControl<S> {
         control: &VoiceControlData,
         update: fn(&VoiceControlData) -> f32,
     ) -> SIMDVoiceControl<S> {
-        unsafe {
+        simd_invoke!(S, {
             SIMDVoiceControl {
-                values: S::set1_ps((update)(control)),
+                values: S::Vf32::set1((update)(control)),
                 update,
             }
-        }
+        })
     }
 }
 
 impl<S: Simd> VoiceGeneratorBase for SIMDVoiceControl<S> {
+    #[inline(always)]
     fn ended(&self) -> bool {
         false
     }
 
-    fn signal_release(&mut self) {}
+    #[inline(always)]
+    fn signal_release(&mut self, _rel_type: ReleaseType) {}
 
+    #[inline(always)]
     fn process_controls(&mut self, control: &VoiceControlData) {
-        unsafe {
-            self.values = S::set1_ps((self.update)(control));
-        }
+        simd_invoke!(S, {
+            self.values = S::Vf32::set1((self.update)(control));
+        })
     }
 }
 
 impl<S: Simd> SIMDVoiceGenerator<S, SIMDSampleMono<S>> for SIMDVoiceControl<S> {
+    #[inline(always)]
     fn next_sample(&mut self) -> SIMDSampleMono<S> {
         SIMDSampleMono(self.values)
     }

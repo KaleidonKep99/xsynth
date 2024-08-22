@@ -1,9 +1,6 @@
 use simdeez::*; // nuts
 
-use simdeez::avx2::*;
-use simdeez::scalar::*;
-use simdeez::sse2::*;
-use simdeez::sse41::*;
+use simdeez::prelude::*;
 
 /// Sum the values of `source` to the values of `target`, writing to `target`.
 ///
@@ -15,23 +12,24 @@ pub fn sum_simd(source: &[f32], target: &mut [f32]) {
             let mut source = &source[..source.len()];
             let mut target = &mut target[..source.len()];
 
-            while source.len() >= S::VF32_WIDTH {
-                let src = S::loadu_ps(&source[0]);
-                let src2 = S::loadu_ps(&target[0]);
+            loop {
+                let src = S::Vf32::load_from_slice(source);
+                let src2 = S::Vf32::load_from_slice(target);
+                let sum = src + src2;
 
-                S::storeu_ps(&mut target[0], src + src2);
+                sum.copy_to_slice(target);
 
-                source = &source[S::VF32_WIDTH..];
-                target = &mut target[S::VF32_WIDTH..];
-            }
+                if source.len() <= S::Vf32::WIDTH {
+                    break;
+                }
 
-            for i in 0..source.len() {
-                target[i] += source[i];
+                source = &source[S::Vf32::WIDTH..];
+                target = &mut target[S::Vf32::WIDTH..];
             }
         }
     );
 
-    sum_runtime_select(source, target);
+    sum(source, target);
 }
 
 #[cfg(test)]
@@ -40,9 +38,9 @@ mod tests {
 
     #[test]
     fn test_simd_add() {
-        let mut src = vec![1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let src = vec![1.0, 2.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
         let mut dst = vec![0.0, 1.0, 3.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-        sum_simd(&mut src, &mut dst);
+        sum_simd(&src, &mut dst);
         assert_eq!(dst, vec![1.0, 3.0, 6.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]);
     }
 }

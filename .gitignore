@@ -1,2 +1,8 @@
 /target
-Cargo.lock
+*.wav
+
+.env
+env.sh
+env.bat
+shell.nix
+.vscode

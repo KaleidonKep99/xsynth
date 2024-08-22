@@ -1,29 +1,35 @@
 [package]
 name = "xsynth-realtime"
-version = "0.1.0"
-edition = "2018"
+description = "A real-time MIDI synthesizer using XSynth."
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-atomic_refcell = "0.1.7"
-bytemuck = "1.7.2"
-cpal = "0.13.3"
-crossbeam-channel = "0.5.1"
-lazy_static = "1.4.0"
-midi-toolkit-rs = { git = "https://github.com/arduano/midi-toolkit-rs", rev = "51ff0dc" }
-rayon = "1.5.1"
-simdeez = { git = "https://github.com/arduano/simdeez", rev = "d72e9a1" }
-sofiza = { git = "https://github.com/arduano/sofiza", rev = "4a013a6" }
-soundfont = "0.0.0"
-spin_sleep = "1.0.0"
+atomic_refcell = "0.1.13"
+bytemuck = "1.16.3"
+cpal = "0.15.3"
+crossbeam-channel = "0.5.13"
+lazy_static = "1.5.0"
+rayon = "1.10.0"
+spin_sleep = "1.2.1"
 to_vec = "0.1.0"
-wav = "1.0.0"
-core = { path = "../core", package = "xsynth-core" }
+wav = "1.0.1"
+xsynth-core = { workspace = true }
+serde = { version = "1.0", optional = true, features = ["derive"] }
+
+[features]
+serde = ["dep:serde", "xsynth-core/serde"]
+
+[dev-dependencies]
+midi-toolkit-rs = "0.1.0"
 
 [build-dependencies]
-cbindgen = "0.20.0"
-
-[profile.release]
-codegen-units = 1
-lto = true
+cbindgen = "0.26.0"

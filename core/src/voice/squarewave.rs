@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
-use simdeez::Simd;
+use simdeez::prelude::*;
 
-use crate::voice::VoiceControlData;
+use crate::voice::{ReleaseType, VoiceControlData};
 
 use super::{SIMDSampleMono, SIMDVoiceGenerator, VoiceGeneratorBase};
 
@@ -39,14 +39,17 @@ where
     S: Simd,
     Pitch: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
 {
+    #[inline(always)]
     fn ended(&self) -> bool {
         false
     }
 
-    fn signal_release(&mut self) {
-        self.pitch_gen.signal_release();
+    #[inline(always)]
+    fn signal_release(&mut self, rel_type: ReleaseType) {
+        self.pitch_gen.signal_release(rel_type);
     }
 
+    #[inline(always)]
     fn process_controls(&mut self, control: &VoiceControlData) {
         self.pitch_gen.process_controls(control);
     }
@@ -57,15 +60,18 @@ where
     S: Simd,
     Pitch: SIMDVoiceGenerator<S, SIMDSampleMono<S>>,
 {
+    #[inline(always)]
     fn next_sample(&mut self) -> SIMDSampleMono<S> {
-        let mut values = unsafe { S::set1_ps(0.0) };
-        let pitch_step = self.pitch_gen.next_sample().0;
-        for i in 0..S::VF32_WIDTH {
-            let phase = self.next_phase(pitch_step[i]);
-            let val = if phase > 0.5 { 1.0 } else { -1.0 };
-            values[i] = val;
-        }
+        simd_invoke!(S, {
+            let mut values = S::Vf32::zeroes();
+            let pitch_step = self.pitch_gen.next_sample().0;
+            for i in 0..S::Vf32::WIDTH {
+                let phase = self.next_phase(pitch_step[i]);
+                let val = if phase > 0.5 { 1.0 } else { -1.0 };
+                values[i] = val;
+            }
 
-        SIMDSampleMono(values)
+            SIMDSampleMono(values)
+        })
     }
 }

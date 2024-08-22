@@ -1,13 +1,12 @@
-use std::sync::Arc;
+use simdeez::prelude::*;
 
-use simdeez::Simd;
-
-use crate::voice::VoiceControlData;
+use crate::soundfont::SoundfontInitOptions;
+use crate::voice::{EnvelopeControlData, ReleaseType, VoiceControlData};
 
 use super::{SIMDSampleMono, SIMDVoiceGenerator, VoiceGeneratorBase};
 
 /// The stages in envelopes as a numbered enum
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum EnvelopeStage {
     Delay = 0,
     Attack = 1,
@@ -47,14 +46,14 @@ struct SIMDLerper<T: Simd> {
 
 impl<T: Simd> SIMDLerper<T> {
     fn new(start: f32, end: f32) -> Self {
-        unsafe {
+        simd_invoke!(T, {
             SIMDLerper {
-                start_simd: T::set1_ps(start),
-                length_simd: T::set1_ps(end - start),
+                start_simd: T::Vf32::set1(start),
+                length_simd: T::Vf32::set1(end - start),
                 start,
                 length: end - start,
             }
-        }
+        })
     }
 
     fn lerp(&self, factor: f32) -> f32 {
@@ -62,7 +61,39 @@ impl<T: Simd> SIMDLerper<T> {
     }
 
     fn lerp_simd(&self, factor: T::Vf32) -> T::Vf32 {
-        self.start_simd + self.length_simd * factor
+        simd_invoke!(T, self.start_simd + self.length_simd * factor)
+    }
+}
+
+struct SIMDLerpToZeroCurve<T: Simd> {
+    start_simd: T::Vf32,
+    start: f32,
+}
+
+impl<T: Simd> SIMDLerpToZeroCurve<T> {
+    fn new(start: f32) -> Self {
+        simd_invoke!(T, {
+            SIMDLerpToZeroCurve {
+                start_simd: T::Vf32::set1(start),
+                start,
+            }
+        })
+    }
+
+    fn lerp(&self, factor: f32) -> f32 {
+        let mult = 1.0 - factor;
+        mult.powi(8) * self.start
+    }
+
+    fn lerp_simd(&self, factor: T::Vf32) -> T::Vf32 {
+        simd_invoke!(T, {
+            let one = T::Vf32::set1(1.0);
+            let r1 = one - factor;
+            let r2 = r1 * r1;
+            let r3 = r2 * r2;
+            let mult = r3 * r3;
+            self.start_simd * mult
+        })
     }
 }
 
@@ -75,29 +106,29 @@ struct StageTime<T: Simd> {
 
 impl<T: Simd> StageTime<T> {
     fn new(start_offset: u32, stage_end_time: u32) -> Self {
-        unsafe {
-            let mut stage_time_simd = T::set1_ps(start_offset as f32);
-            for i in 0..T::VF32_WIDTH {
+        simd_invoke!(T, {
+            let mut stage_time_simd = T::Vf32::set1(start_offset as f32);
+            for i in 0..T::Vf32::WIDTH {
                 stage_time_simd[i] += i as f32;
             }
 
             StageTime {
                 stage_time_simd,
                 stage_end_time_f32: stage_end_time as f32,
-                increment_simd: T::set1_ps(T::VF32_WIDTH as f32),
-                stage_end_time_simd: T::set1_ps(stage_end_time as f32),
+                increment_simd: T::Vf32::set1(T::Vf32::WIDTH as f32),
+                stage_end_time_simd: T::Vf32::set1(stage_end_time as f32),
             }
-        }
+        })
     }
 
     #[inline(always)]
     fn increment(&mut self) {
-        self.stage_time_simd += self.increment_simd;
+        simd_invoke!(T, self.stage_time_simd += self.increment_simd);
     }
 
     #[inline(always)]
     fn increment_by(&mut self, by: u32) {
-        self.stage_time_simd += unsafe { T::set1_ps(by as f32) };
+        simd_invoke!(T, self.stage_time_simd += T::Vf32::set1(by as f32));
     }
 
     #[inline(always)]
@@ -119,7 +150,7 @@ impl<T: Simd> StageTime<T> {
 
     #[inline(always)]
     pub fn progress_simd_array(&self) -> T::Vf32 {
-        *self.raw_simd_array() / self.stage_end_time_simd
+        simd_invoke!(T, *self.raw_simd_array() / self.stage_end_time_simd)
     }
 
     #[inline(always)]
@@ -129,7 +160,7 @@ impl<T: Simd> StageTime<T> {
 
     #[inline(always)]
     pub fn simd_array_end_f32(&self) -> f32 {
-        self.stage_time_simd[T::VF32_WIDTH - 1]
+        self.stage_time_simd[T::Vf32::WIDTH - 1]
     }
 
     #[allow(unused)]
@@ -145,23 +176,25 @@ impl<T: Simd> StageTime<T> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum EnvelopePart {
     Lerp {
         target: f32,   // Target value by the end of the envelope part
         duration: u32, // Duration in samples
-        cache_index: usize,
+    },
+    LerpToZeroCurve {
+        duration: u32,
     },
     Hold(f32),
 }
 
 impl EnvelopePart {
-    pub fn lerp(cache_index: usize, target: f32, duration: u32) -> EnvelopePart {
-        EnvelopePart::Lerp {
-            target,
-            duration,
-            cache_index,
-        }
+    pub fn lerp(target: f32, duration: u32) -> EnvelopePart {
+        EnvelopePart::Lerp { target, duration }
+    }
+
+    pub fn lerp_to_zero_curve(duration: u32) -> EnvelopePart {
+        EnvelopePart::LerpToZeroCurve { duration }
     }
 
     pub fn hold(value: f32) -> EnvelopePart {
@@ -170,7 +203,7 @@ impl EnvelopePart {
 }
 
 /// The original envelope descriptor
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct EnvelopeDescriptor {
     pub start_percent: f32,   // % (0-1)
     pub delay: f32,           // Seconds
@@ -182,52 +215,38 @@ pub struct EnvelopeDescriptor {
 }
 
 impl EnvelopeDescriptor {
-    pub fn to_envelope_params(&self, samplerate: u32) -> EnvelopeParameters {
+    #[allow(clippy::wrong_self_convention)]
+    pub fn to_envelope_params(
+        &self,
+        samplerate: u32,
+        options: SoundfontInitOptions,
+    ) -> EnvelopeParameters {
         let samplerate = samplerate as f32;
 
-        fn gen_lerp(from: f32, to: f32, len: u32) -> Box<[f32]> {
-            let mut vec = Vec::new();
-
-            for i in 0..len {
-                vec.push(from + (to - from) * i as f32 / len as f32);
-            }
-
-            vec.into()
-        }
+        let release = if options.linear_release {
+            EnvelopePart::lerp(0.0, (self.release * samplerate) as u32)
+        } else {
+            EnvelopePart::lerp_to_zero_curve((self.release * samplerate) as u32)
+        };
 
         EnvelopeParameters {
             start: self.start_percent,
             parts: [
                 // Delay
-                EnvelopePart::lerp(0, self.start_percent, (self.delay * samplerate) as u32),
+                EnvelopePart::lerp(self.start_percent, (self.delay * samplerate) as u32),
                 // Attack
-                EnvelopePart::lerp(1, 1.0, (self.attack * samplerate) as u32),
+                EnvelopePart::lerp(1.0, (self.attack * samplerate) as u32),
                 // Hold
-                EnvelopePart::lerp(2, 1.0, (self.hold * samplerate) as u32),
+                EnvelopePart::lerp(1.0, (self.hold * samplerate) as u32),
                 // Decay
-                EnvelopePart::lerp(3, self.sustain_percent, (self.decay * samplerate) as u32),
+                EnvelopePart::lerp(self.sustain_percent, (self.decay * samplerate) as u32),
                 // Sustain
                 EnvelopePart::hold(self.sustain_percent),
                 // Release
-                EnvelopePart::lerp(4, 0.0, (self.release * samplerate) as u32),
+                release,
                 // Finished
                 EnvelopePart::hold(0.0),
             ],
-            caches: Box::new([
-                gen_lerp(
-                    self.start_percent,
-                    self.start_percent,
-                    (self.delay * samplerate) as u32,
-                ),
-                gen_lerp(self.start_percent, 1.0, (self.attack * samplerate) as u32),
-                gen_lerp(1.0, 1.0, (self.hold * samplerate) as u32),
-                gen_lerp(1.0, self.sustain_percent, (self.decay * samplerate) as u32),
-                gen_lerp(
-                    self.sustain_percent,
-                    0.0,
-                    (self.release * samplerate) as u32,
-                ),
-            ]),
         }
     }
 }
@@ -235,46 +254,26 @@ impl EnvelopeDescriptor {
 /// The raw envelope parameters used to generate the envelope.
 /// Is a separate struct to EnvelopeDescriptor for performance reasons.
 /// Use EnvelopeDescriptor to generate the EnvelopeParameters struct.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct EnvelopeParameters {
     start: f32,
-    parts: [EnvelopePart; 7],
-    caches: Box<[Box<[f32]>]>,
+    pub parts: [EnvelopePart; 7],
 }
 
 impl EnvelopeParameters {
-    fn get_cache_at(&self, index: usize) -> &Box<[f32]> {
-        &self.caches[index]
-    }
-
     fn get_stage_data<T: Simd>(
         &self,
         stage: EnvelopeStage,
         start_amp: f32,
     ) -> VoiceEnvelopeState<T> {
-        let stage_info = &self.parts[stage.as_usize()];
-        match stage_info {
-            EnvelopePart::Lerp {
-                target,
-                duration,
-                cache_index,
-            } => {
-                let duration = *duration;
-                let target = *target;
-                if duration == 0 {
-                    self.get_stage_data(stage.next_stage(), target)
-                } else {
-                    let cache_index = *cache_index;
-                    if false && self.get_cache_at(cache_index)[0] == start_amp {
-                        let data = StageData::Cache {
-                            cache_index,
-                            length: self.get_cache_at(cache_index).len(),
-                            time: 0,
-                        };
-                        VoiceEnvelopeState {
-                            current_stage: stage,
-                            stage_data: data,
-                        }
+        simd_invoke!(T, {
+            let stage_info = &self.parts[stage.as_usize()];
+            match stage_info {
+                EnvelopePart::Lerp { target, duration } => {
+                    let duration = *duration;
+                    let target = *target;
+                    if duration == 0 {
+                        self.get_stage_data(stage.next_stage(), target)
                     } else {
                         let data = StageData::Lerp(
                             SIMDLerper::new(start_amp, target),
@@ -286,25 +285,52 @@ impl EnvelopeParameters {
                         }
                     }
                 }
-            }
-            EnvelopePart::Hold(value) => {
-                let data = StageData::Constant(unsafe { T::set1_ps(*value) });
-                VoiceEnvelopeState {
-                    current_stage: stage,
-                    stage_data: data,
+                EnvelopePart::LerpToZeroCurve { duration } => {
+                    let duration = *duration;
+                    if duration == 0 {
+                        self.get_stage_data(stage.next_stage(), 0.0)
+                    } else {
+                        let data = StageData::LerpToZeroCurve(
+                            SIMDLerpToZeroCurve::new(start_amp),
+                            StageTime::new(0, duration),
+                        );
+                        VoiceEnvelopeState {
+                            current_stage: stage,
+                            stage_data: data,
+                        }
+                    }
+                }
+                EnvelopePart::Hold(value) => {
+                    let data = StageData::Constant(T::Vf32::set1(*value));
+                    VoiceEnvelopeState {
+                        current_stage: stage,
+                        stage_data: data,
+                    }
                 }
             }
+        })
+    }
+
+    pub fn get_stage_duration(&self, stage: EnvelopeStage) -> u32 {
+        let stage_info = &self.parts[stage.as_usize()];
+        match stage_info {
+            EnvelopePart::Lerp {
+                target: _,
+                duration,
+            } => *duration,
+            EnvelopePart::LerpToZeroCurve { duration } => *duration,
+            EnvelopePart::Hold(_) => 0,
         }
+    }
+
+    pub fn modify_stage_data(&mut self, part: usize, data: EnvelopePart) {
+        self.parts[part] = data;
     }
 }
 
 enum StageData<T: Simd> {
     Lerp(SIMDLerper<T>, StageTime<T>),
-    Cache {
-        time: usize,
-        length: usize,
-        cache_index: usize,
-    },
+    LerpToZeroCurve(SIMDLerpToZeroCurve<T>, StageTime<T>),
     Constant(T::Vf32),
 }
 
@@ -314,15 +340,31 @@ struct VoiceEnvelopeState<T: Simd> {
 }
 
 pub struct SIMDVoiceEnvelope<T: Simd> {
-    params: Arc<EnvelopeParameters>,
+    original_params: EnvelopeParameters,
+    params: EnvelopeParameters,
+    allow_release: bool,
     state: VoiceEnvelopeState<T>,
+    sample_rate: f32,
+    killed: bool,
 }
 
 impl<T: Simd> SIMDVoiceEnvelope<T> {
-    pub fn new(params: Arc<EnvelopeParameters>) -> Self {
+    pub fn new(
+        original_params: EnvelopeParameters,
+        params: EnvelopeParameters,
+        allow_release: bool,
+        sample_rate: f32,
+    ) -> Self {
         let state = params.get_stage_data(EnvelopeStage::Delay, params.start);
 
-        SIMDVoiceEnvelope { params, state }
+        SIMDVoiceEnvelope {
+            original_params,
+            params,
+            allow_release,
+            state,
+            sample_rate,
+            killed: false,
+        }
     }
 
     pub fn get_value_at_current_time(&self) -> f32 {
@@ -330,16 +372,10 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
             StageData::Lerp(lerper, stage_time) => {
                 lerper.lerp(stage_time.simd_array_start_f32() / stage_time.stage_end_time_f32)
             }
-            StageData::Constant(constant) => constant[0],
-            StageData::Cache {
-                time, cache_index, ..
-            } => {
-                let cache = self.params.get_cache_at(*cache_index);
-                match cache.get(*time) {
-                    Some(value) => *value,
-                    None => cache[cache.len() - 1],
-                }
+            StageData::LerpToZeroCurve(lerper, stage_time) => {
+                lerper.lerp(stage_time.simd_array_start_f32() / stage_time.stage_end_time_f32)
             }
+            StageData::Constant(constant) => constant[0],
         }
     }
 
@@ -354,103 +390,163 @@ impl<T: Simd> SIMDVoiceEnvelope<T> {
             .get_stage_data(self.current_stage().next_stage(), amp);
     }
 
+    fn update_stage(&mut self) {
+        let amp = self.get_value_at_current_time();
+        self.state = self.params.get_stage_data(*self.current_stage(), amp);
+    }
+
     fn increment_time_by(&mut self, increment: u32) {
         match &mut self.state.stage_data {
             StageData::Lerp(_, stage_time) => {
                 stage_time.increment_by(increment);
             }
-            StageData::Constant(_) => {}
-            StageData::Cache { time, .. } => {
-                *time += increment as usize;
+            StageData::LerpToZeroCurve(_, stage_time) => {
+                stage_time.increment_by(increment);
             }
+            StageData::Constant(_) => {}
         }
     }
 
     fn manually_build_simd_sample(&mut self) -> SIMDSampleMono<T> {
-        let mut values = unsafe { T::set1_ps(0.0) };
-        for i in 0..T::VF32_WIDTH {
-            let sample = self.get_value_at_current_time();
-            values[i] = sample;
-            self.increment_time_by(1);
-            let should_progress = match &mut self.state.stage_data {
-                StageData::Lerp(_, stage_time) => {
-                    stage_time.is_ending() && !stage_time.is_intersecting_end()
+        simd_invoke!(T, {
+            let mut values = T::Vf32::set1(0.0);
+            for i in 0..T::Vf32::WIDTH {
+                let sample = self.get_value_at_current_time();
+                values[i] = sample;
+                self.increment_time_by(1);
+                let should_progress = match &mut self.state.stage_data {
+                    StageData::Lerp(_, stage_time) | StageData::LerpToZeroCurve(_, stage_time) => {
+                        stage_time.is_ending() && !stage_time.is_intersecting_end()
+                    }
+                    StageData::Constant(_) => false,
+                };
+                if should_progress {
+                    self.switch_to_next_stage();
                 }
-                StageData::Constant(_) => false,
-                StageData::Cache { time, length, .. } => *time >= *length,
-            };
-            if should_progress {
-                self.switch_to_next_stage();
+            }
+            SIMDSampleMono(values)
+        })
+    }
+
+    pub fn get_modified_envelope(
+        mut params: EnvelopeParameters,
+        envelope: EnvelopeControlData,
+        sample_rate: f32,
+    ) -> EnvelopeParameters {
+        fn calculate_curve(value: u8, duration: f32) -> f32 {
+            match value {
+                0..=64 => (value as f32 / 64.0).powi(5) * duration,
+                65..=128 => duration + ((value as f32 - 64.0) / 64.0).powi(3) * 15.0,
+                _ => duration,
             }
         }
-        SIMDSampleMono(values)
+
+        if let Some(attack) = envelope.attack {
+            let duration = params.get_stage_duration(EnvelopeStage::Attack) as f32 / sample_rate;
+            params.modify_stage_data(
+                1,
+                EnvelopePart::lerp(
+                    1.0,
+                    (calculate_curve(attack, duration) * sample_rate) as u32,
+                ),
+            );
+        }
+        if let Some(release) = envelope.release {
+            let duration = params.get_stage_duration(EnvelopeStage::Release) as f32 / sample_rate;
+            params.modify_stage_data(
+                5,
+                EnvelopePart::lerp_to_zero_curve(
+                    (calculate_curve(release, duration).max(0.02) * sample_rate) as u32,
+                ),
+            );
+        }
+
+        params
+    }
+
+    pub fn modify_envelope(&mut self, envelope: EnvelopeControlData) {
+        if !self.killed {
+            self.params =
+                Self::get_modified_envelope(self.original_params, envelope, self.sample_rate);
+            self.update_stage();
+        }
     }
 }
 
 impl<T: Simd> VoiceGeneratorBase for SIMDVoiceEnvelope<T> {
+    #[inline(always)]
     fn ended(&self) -> bool {
         self.state.current_stage == EnvelopeStage::Finished
     }
 
-    fn signal_release(&mut self) {
-        let amp = self.get_value_at_current_time();
-        self.state = self.params.get_stage_data(EnvelopeStage::Release, amp);
+    #[inline(always)]
+    fn signal_release(&mut self, rel_type: ReleaseType) {
+        if rel_type == ReleaseType::Kill {
+            self.params.modify_stage_data(
+                5,
+                EnvelopePart::lerp(0.0, (0.001 * self.sample_rate) as u32),
+            );
+            self.update_stage();
+            self.killed = true;
+        }
+        if self.allow_release || self.killed {
+            let amp = self.get_value_at_current_time();
+            self.state = self.params.get_stage_data(EnvelopeStage::Release, amp);
+        }
     }
 
-    fn process_controls(&mut self, _control: &VoiceControlData) {}
+    #[inline(always)]
+    fn process_controls(&mut self, control: &VoiceControlData) {
+        self.modify_envelope(control.envelope);
+    }
 }
 
 impl<T: Simd> SIMDVoiceGenerator<T, SIMDSampleMono<T>> for SIMDVoiceEnvelope<T> {
+    #[inline(always)]
     fn next_sample(&mut self) -> SIMDSampleMono<T> {
-        match &mut self.state.stage_data {
-            StageData::Lerp(lerper, stage_time) => {
-                if stage_time.is_ending() {
-                    if stage_time.is_intersecting_end() {
-                        // It is ended, and the SIMD array intersects the border of the envelope part.
-                        // Therefore, this needs to generate one float sample at a time for this SIMD array.
-                        self.manually_build_simd_sample()
+        simd_invoke!(T, {
+            match &mut self.state.stage_data {
+                StageData::Lerp(lerper, stage_time) => {
+                    if stage_time.is_ending() {
+                        if stage_time.is_intersecting_end() {
+                            // It is ended, and the SIMD array intersects the border of the envelope part.
+                            // Therefore, this needs to generate one float sample at a time for this SIMD array.
+                            self.manually_build_simd_sample()
+                        } else {
+                            // Is ended, except the SIMD array isn't intersecting the end.
+                            // Therefore can jump to the next stage, and try again
+                            self.switch_to_next_stage();
+                            self.next_sample()
+                        }
                     } else {
-                        // Is ended, except the SIMD array isn't intersecting the end.
-                        // Therefore can jump to the next stage, and try again
-                        self.switch_to_next_stage();
-                        self.next_sample()
+                        // No special conditions happening, return the next entire simd array lerped
+                        let values = lerper.lerp_simd(stage_time.progress_simd_array());
+                        stage_time.increment();
+                        SIMDSampleMono(values)
                     }
-                } else {
-                    // No special conditions happening, return the next entire simd array lerped
-                    let values = lerper.lerp_simd(stage_time.progress_simd_array());
-                    stage_time.increment();
-                    SIMDSampleMono(values)
                 }
-            }
-            StageData::Constant(constant) => SIMDSampleMono(*constant),
-            StageData::Cache {
-                time,
-                length,
-                cache_index,
-            } => {
-                if *time + T::VF32_WIDTH >= *length {
-                    if *time < *length {
-                        // It is ended, and the SIMD array intersects the border of the envelope part.
-                        // Therefore, this needs to generate one float sample at a time for this SIMD array.
-                        self.manually_build_simd_sample()
+                StageData::LerpToZeroCurve(lerper, stage_time) => {
+                    if stage_time.is_ending() {
+                        if stage_time.is_intersecting_end() {
+                            // It is ended, and the SIMD array intersects the border of the envelope part.
+                            // Therefore, this needs to generate one float sample at a time for this SIMD array.
+                            self.manually_build_simd_sample()
+                        } else {
+                            // Is ended, except the SIMD array isn't intersecting the end.
+                            // Therefore can jump to the next stage, and try again
+                            self.switch_to_next_stage();
+                            self.next_sample()
+                        }
                     } else {
-                        // Is ended, except the SIMD array isn't intersecting the end.
-                        // Therefore can jump to the next stage, and try again
-                        self.switch_to_next_stage();
-                        self.next_sample()
+                        // No special conditions happening, return the next entire simd array lerped
+                        let values = lerper.lerp_simd(stage_time.progress_simd_array());
+                        stage_time.increment();
+                        SIMDSampleMono(values)
                     }
-                } else {
-                    // No special conditions happening, return the next entire simd array lerped
-                    let mut values = unsafe { T::set1_ps(0.0) };
-                    let cache = self.params.get_cache_at(*cache_index);
-                    for i in 0..T::VF32_WIDTH {
-                        values[i] = cache[*time];
-                        *time += 1;
-                    }
-                    SIMDSampleMono(values)
                 }
+                StageData::Constant(constant) => SIMDSampleMono(*constant),
             }
-        }
+        })
     }
 }
 
@@ -461,28 +557,19 @@ mod tests {
 
     use super::*;
 
-    use simdeez::*; // nuts
-
-    use simdeez::avx2::*;
-    use simdeez::scalar::*;
-    use simdeez::sse2::*;
-    use simdeez::sse41::*;
-
     fn assert_vf32_equal<S: Simd>(a: S::Vf32, b: S::Vf32) {
-        for i in 0..S::VF32_WIDTH {
+        for i in 0..S::Vf32::WIDTH {
             assert_eq!(a[i], b[i]);
         }
     }
 
     fn simd_from_vec<S: Simd>(vec: Vec<f32>) -> S::Vf32 {
-        unsafe {
-            let mut initial = S::set1_ps(0.0);
-            let mut iter = vec.into_iter();
-            for i in 0..S::VF32_WIDTH {
-                initial[i] = iter.next().unwrap();
-            }
-            initial
+        let mut initial = S::Vf32::set1(0.0);
+        let mut iter = vec.into_iter();
+        for i in 0..S::Vf32::WIDTH {
+            initial[i] = iter.next().unwrap();
         }
+        initial
     }
 
     #[test]
@@ -493,13 +580,13 @@ mod tests {
                 assert_eq!(lerper.lerp(0.0), 0.0);
                 assert_eq!(lerper.lerp(0.5), 0.5);
                 assert_eq!(lerper.lerp(1.0), 1.0);
-                assert_vf32_equal::<S>(lerper.lerp_simd(S::set1_ps(0.0)), S::set1_ps(0.0));
-                assert_vf32_equal::<S>(lerper.lerp_simd(S::set1_ps(0.5)), S::set1_ps(0.5));
-                assert_vf32_equal::<S>(lerper.lerp_simd(S::set1_ps(1.0)), S::set1_ps(1.0));
+                assert_vf32_equal::<S>(lerper.lerp_simd(S::Vf32::set1(0.0)), S::Vf32::set1(0.0));
+                assert_vf32_equal::<S>(lerper.lerp_simd(S::Vf32::set1(0.5)), S::Vf32::set1(0.5));
+                assert_vf32_equal::<S>(lerper.lerp_simd(S::Vf32::set1(1.0)), S::Vf32::set1(1.0));
             }
         );
 
-        run_runtime_select();
+        run();
     }
 
     #[test]
@@ -513,62 +600,69 @@ mod tests {
                 let mut time = StageTime::<S>::new(5, 20);
                 let mut time2 = StageTime::<S>::new(4, 20);
                 assert_eq!(time.simd_array_start(), 5);
-                assert_eq!(time.is_ending(), false);
+                assert!(!time.is_ending());
 
-                let end_simd = S::set1_ps(20.0);
+                let end_simd = S::Vf32::set1(20.0);
 
                 assert_vf32_equal::<S>(
                     *time.raw_simd_array(),
-                    simd_from_range::<S>(5..(5 + S::VF32_WIDTH)),
+                    simd_from_range::<S>(5..(5 + S::Vf32::WIDTH)),
                 );
                 assert_vf32_equal::<S>(
                     time.progress_simd_array(),
-                    simd_from_range::<S>(5..(5 + S::VF32_WIDTH)) / end_simd,
+                    simd_from_range::<S>(5..(5 + S::Vf32::WIDTH)) / end_simd,
                 );
 
                 let mut i = 5;
-                while time.simd_array_start() + S::VF32_WIDTH as u32 <= 20 {
+                while time.simd_array_start() + S::Vf32::WIDTH as u32 <= 20 {
                     assert_vf32_equal::<S>(
                         *time.raw_simd_array(),
-                        simd_from_range::<S>(i..(i + S::VF32_WIDTH)),
+                        simd_from_range::<S>(i..(i + S::Vf32::WIDTH)),
                     );
                     assert_vf32_equal::<S>(
                         time.progress_simd_array(),
-                        simd_from_range::<S>(5..(5 + S::VF32_WIDTH)) / end_simd,
+                        simd_from_range::<S>(5..(5 + S::Vf32::WIDTH)) / end_simd,
                     );
                     assert_eq!(time.simd_array_start(), i as u32);
-                    assert_eq!(time.is_ending(), false);
+                    assert!(!time.is_ending());
 
-                    assert_eq!(time.is_intersecting_end(), false);
+                    assert!(!time.is_intersecting_end());
 
                     time.increment();
                     time2.increment();
-                    i += S::VF32_WIDTH;
+                    i += S::Vf32::WIDTH;
                 }
                 assert_eq!(time.simd_array_start(), i as u32);
-                assert_eq!(time.is_ending(), true);
-                assert_eq!(time.is_intersecting_end(), true);
+                assert!(time.is_ending());
+                assert!(time.is_intersecting_end());
 
-                assert_eq!(time2.is_ending(), false);
+                assert!(!time2.is_ending());
                 time2.increment();
-                assert_eq!(time2.is_ending(), true);
-                assert_eq!(time2.is_intersecting_end(), false);
+                assert!(time2.is_ending());
+                assert!(!time2.is_intersecting_end());
             }
         );
 
-        run_runtime_select();
+        run();
     }
 
     #[test]
     fn test_envelope() {
+        #![allow(clippy::same_item_push)]
+
         fn push_simd_to_vec<S: Simd>(vec: &mut Vec<f32>, simd: S::Vf32) {
-            for i in 0..S::VF32_WIDTH {
+            for i in 0..S::Vf32::WIDTH {
                 vec.push(simd[i]);
             }
         }
 
         fn lerp(from: f32, to: f32, fac: f32) -> f32 {
             from + (to - from) * fac
+        }
+
+        fn lerp_to_zero_curve(from: f32, fac: f32) -> f32 {
+            let mult = (1. - fac).powi(8);
+            mult * from
         }
 
         simd_runtime_generate!(
@@ -584,20 +678,20 @@ mod tests {
                     sustain_percent: 0.4,
                     release: 16.0,
                 };
-                let params = Arc::new(descriptor.to_envelope_params(1));
+                let params = descriptor.to_envelope_params(1, Default::default());
 
-                let mut env = SIMDVoiceEnvelope::<S>::new(params);
+                let mut env = SIMDVoiceEnvelope::<S>::new(params, params, true, 1.0);
 
                 let mut i = 0;
                 while i < 48 {
                     push_simd_to_vec::<S>(&mut vec, env.next_sample().0);
-                    i += S::VF32_WIDTH;
+                    i += S::Vf32::WIDTH;
                 }
-                env.signal_release();
+                env.signal_release(ReleaseType::Standard);
                 assert_eq!(env.current_stage(), &EnvelopeStage::Release);
                 while i < 48 + 32 {
                     push_simd_to_vec::<S>(&mut vec, env.next_sample().0);
-                    i += S::VF32_WIDTH;
+                    i += S::Vf32::WIDTH;
                 }
 
                 let mut expected_vec = Vec::new();
@@ -612,16 +706,21 @@ mod tests {
                     expected_vec.push(0.4);
                 }
                 for i in 0..16 {
-                    expected_vec.push(lerp(0.4, 0.0, i as f32 / 16.0));
+                    expected_vec.push(lerp_to_zero_curve(0.4, i as f32 / 16.0));
                 }
                 for _ in 0..16 {
                     expected_vec.push(0.0);
+                }
+
+                for v in vec.iter_mut().chain(expected_vec.iter_mut()) {
+                    // Rounding as cached values are sometimes off by tiny fractions
+                    *v = (*v * 10000.0).round() / 10000.0;
                 }
 
                 assert_eq!(vec, expected_vec);
             }
         );
 
-        run_runtime_select();
+        run();
     }
 }

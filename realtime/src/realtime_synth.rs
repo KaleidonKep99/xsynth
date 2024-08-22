@@ -1,291 +1,31 @@
 use std::{
-    cell::UnsafeCell,
     collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
     },
     thread::{self},
-    time::{Duration, Instant},
 };
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    Device, PauseStreamError, PlayStreamError, Sample, Stream, SupportedStreamConfig,
+    Device, PauseStreamError, PlayStreamError, SizedSample, Stream, SupportedStreamConfig,
 };
-use crossbeam_channel::{bounded, unbounded, Sender};
-use to_vec::ToVec;
+use crossbeam_channel::{bounded, unbounded};
 
-use core::{
-    channel::{ChannelEvent, ControlEvent, VoiceChannel},
+use xsynth_core::{
+    buffered_renderer::{BufferedRenderer, BufferedRendererStatsReader},
+    channel::{ChannelConfigEvent, ChannelEvent, VoiceChannel},
     effects::VolumeLimiter,
     helpers::{prepapre_cache_vec, sum_simd},
-    AudioPipe, AudioStreamParams, BufferedRenderer, BufferedRendererStatsReader, FunctionAudioPipe,
+    AudioPipe, AudioStreamParams, FunctionAudioPipe,
 };
 
-use crate::SynthEvent;
+use crate::{
+    util::ReadWriteAtomicU64, RealtimeEventSender, SynthEvent, ThreadCount, XSynthRealtimeConfig,
+};
 
-struct ReadWriteAtomicU64(UnsafeCell<u64>);
-
-impl ReadWriteAtomicU64 {
-    fn new(value: u64) -> Self {
-        ReadWriteAtomicU64(UnsafeCell::new(value))
-    }
-
-    fn read(&self) -> u64 {
-        unsafe { *self.0.get() }
-    }
-
-    fn write(&self, value: u64) {
-        unsafe { *self.0.get() = value }
-    }
-}
-
-unsafe impl Send for ReadWriteAtomicU64 {}
-unsafe impl Sync for ReadWriteAtomicU64 {}
-
-static NPS_WINDOW_MILLISECONDS: u64 = 20;
-
-struct NpsWindow {
-    time: u64,
-    notes: u64,
-}
-
-/// A struct for tracking the estimated NPS, as fast as possible with the focus on speed
-/// rather than precision. Used for NPS limiting on extremely spammy midis.
-struct RoughNpsTracker {
-    rough_time: Arc<ReadWriteAtomicU64>,
-    last_time: u64,
-    windows: VecDeque<NpsWindow>,
-    total_window_sum: u64,
-    current_window_sum: u64,
-    stop: Arc<RwLock<bool>>,
-}
-
-impl RoughNpsTracker {
-    pub fn new() -> RoughNpsTracker {
-        let rough_time = Arc::new(ReadWriteAtomicU64::new(0));
-        let stop = Arc::new(RwLock::new(false));
-
-        {
-            let rough_time = rough_time.clone();
-            let stop = stop.clone();
-            thread::spawn(move || {
-                let mut last_time = 0;
-                let mut now = Instant::now();
-                while *stop.read().unwrap() == false {
-                    thread::sleep(Duration::from_millis(NPS_WINDOW_MILLISECONDS));
-                    let diff = now.elapsed();
-                    last_time += diff.as_millis() as u64;
-                    rough_time.write(last_time);
-                    now = Instant::now();
-                }
-            });
-        }
-
-        RoughNpsTracker {
-            rough_time,
-            last_time: 0,
-            windows: VecDeque::new(),
-            total_window_sum: 0,
-            current_window_sum: 0,
-            stop,
-        }
-    }
-
-    pub fn calculate_nps(&mut self) -> u64 {
-        self.check_time();
-
-        loop {
-            let cutoff = self.last_time - 1000;
-            if let Some(window) = self.windows.front() {
-                if window.time < cutoff {
-                    self.total_window_sum -= window.notes;
-                    self.windows.pop_front();
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        let short_nps = self.current_window_sum * (1000 / NPS_WINDOW_MILLISECONDS) * 4 / 3;
-        let long_nps = self.total_window_sum;
-
-        short_nps.max(long_nps)
-    }
-
-    fn check_time(&mut self) {
-        let time = self.rough_time.read();
-        if time > self.last_time {
-            self.windows.push_back(NpsWindow {
-                time: self.last_time,
-                notes: self.current_window_sum,
-            });
-            self.current_window_sum = 0;
-            self.last_time = time;
-        }
-    }
-
-    pub fn add_note(&mut self) {
-        self.current_window_sum += 1;
-        self.total_window_sum += 1;
-    }
-}
-
-impl Drop for RoughNpsTracker {
-    fn drop(&mut self) {
-        *self.stop.write().unwrap() = true;
-    }
-}
-
-fn should_send_for_vel_and_nps(vel: u8, nps: u64, max: u64) -> bool {
-    vel as u64 * 100 + max > nps
-}
-
-struct EventSender {
-    sender: Sender<ChannelEvent>,
-    nps: RoughNpsTracker,
-    max_nps: Arc<ReadWriteAtomicU64>,
-    skipped_notes: [u64; 128],
-}
-
-impl EventSender {
-    pub fn new(max_nps: Arc<ReadWriteAtomicU64>, sender: Sender<ChannelEvent>) -> Self {
-        EventSender {
-            sender,
-            nps: RoughNpsTracker::new(),
-            max_nps,
-            skipped_notes: [0; 128],
-        }
-    }
-
-    pub fn send(&mut self, event: ChannelEvent) {
-        match &event {
-            ChannelEvent::NoteOn { vel, key } => {
-                let nps = self.nps.calculate_nps();
-                if should_send_for_vel_and_nps(*vel, nps, self.max_nps.read()) {
-                    self.sender.send(event).ok();
-                    self.nps.add_note();
-                } else {
-                    self.skipped_notes[*key as usize] += 1;
-                }
-            }
-            ChannelEvent::NoteOff { key } => {
-                if self.skipped_notes[*key as usize] > 0 {
-                    self.skipped_notes[*key as usize] -= 1;
-                } else {
-                    self.sender.send(event).ok();
-                }
-            }
-            _ => {
-                self.sender.send(event).ok();
-            }
-        }
-    }
-}
-
-impl Clone for EventSender {
-    fn clone(&self) -> Self {
-        EventSender {
-            sender: self.sender.clone(),
-            max_nps: self.max_nps.clone(),
-
-            // Rough nps tracker is only used for very extreme spam situations,
-            // so creating a new one when cloning shouldn't be an issue
-            nps: RoughNpsTracker::new(),
-
-            // Skipped notes is related to nps limiter, therefore it's also not cloned
-            skipped_notes: [0; 128],
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct RealtimeEventSender {
-    senders: Vec<EventSender>,
-}
-
-impl RealtimeEventSender {
-    fn new(
-        senders: Vec<Sender<ChannelEvent>>,
-        max_nps: Arc<ReadWriteAtomicU64>,
-    ) -> RealtimeEventSender {
-        RealtimeEventSender {
-            senders: senders
-                .into_iter()
-                .map(|s| EventSender::new(max_nps.clone(), s))
-                .collect(),
-        }
-    }
-
-    pub fn send_event(&mut self, event: SynthEvent) {
-        match event {
-            SynthEvent::Channel(channel, event) => {
-                self.senders[channel as usize].send(event);
-            }
-            SynthEvent::AllChannels(event) => {
-                for sender in self.senders.iter_mut() {
-                    sender.send(event.clone());
-                }
-            }
-        }
-    }
-
-    pub fn send_event_u32(&mut self, event: u32) {
-        let head = event & 0xFF;
-        let channel = head & 0xF;
-        let code = head >> 4;
-
-        macro_rules! val1 {
-            () => {
-                (event >> 8) as u8
-            };
-        }
-
-        macro_rules! val2 {
-            () => {
-                (event >> 16) as u8
-            };
-        }
-
-        match code {
-            0x8 => {
-                self.send_event(SynthEvent::Channel(
-                    channel,
-                    ChannelEvent::NoteOff { key: val1!() },
-                ));
-            }
-            0x9 => {
-                self.send_event(SynthEvent::Channel(
-                    channel,
-                    ChannelEvent::NoteOn {
-                        key: val1!(),
-                        vel: val2!(),
-                    },
-                ));
-            }
-            0xB => {
-                self.send_event(SynthEvent::Channel(
-                    channel,
-                    ChannelEvent::Control(ControlEvent::Raw(val1!(), val2!())),
-                ));
-            }
-            0xE => {
-                let value = (((val2!() as i16) << 7) | val1!() as i16) - 8192;
-                let value = value as f32 / 8192.0;
-                self.send_event(SynthEvent::Channel(
-                    channel,
-                    ChannelEvent::Control(ControlEvent::PitchBendValue(value)),
-                ));
-            }
-
-            _ => {}
-        }
-    }
-}
-
+/// Holds the statistics for an instance of RealtimeSynth.
 #[derive(Debug, Clone)]
 struct RealtimeSynthStats {
     voice_count: Arc<AtomicU64>,
@@ -299,6 +39,7 @@ impl RealtimeSynthStats {
     }
 }
 
+/// Reads the statistics of an instance of RealtimeSynth in a usable way.
 pub struct RealtimeSynthStatsReader {
     buffered_stats: BufferedRendererStatsReader,
     stats: RealtimeSynthStats,
@@ -315,23 +56,31 @@ impl RealtimeSynthStatsReader {
         }
     }
 
+    /// Returns the active voice count of all the MIDI channels.
     pub fn voice_count(&self) -> u64 {
         self.stats.voice_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the statistics of the buffered renderer used.
+    ///
+    /// See the BufferedRendererStatsReader documentation for more information.
     pub fn buffer(&self) -> &BufferedRendererStatsReader {
         &self.buffered_stats
     }
 }
 
-pub struct RealtimeSynth {
-    // Kept for ownership
-    _channels: Vec<VoiceChannel>,
+struct RealtimeSynthThreadSharedData {
     buffered_renderer: Arc<Mutex<BufferedRenderer>>,
 
     stream: Stream,
 
     event_senders: RealtimeEventSender,
+}
+
+/// A realtime MIDI synthesizer using an audio device for output.
+pub struct RealtimeSynth {
+    data: Option<RealtimeSynthThreadSharedData>,
+    join_handles: Vec<thread::JoinHandle<()>>,
 
     stats: RealtimeSynthStats,
 
@@ -339,7 +88,9 @@ pub struct RealtimeSynth {
 }
 
 impl RealtimeSynth {
-    pub fn open_with_default_output(channel_count: u32) -> Self {
+    /// Initializes a new realtime synthesizer using the default config and
+    /// the default audio output.
+    pub fn open_with_all_defaults() -> Self {
         let host = cpal::default_host();
 
         let device = host
@@ -347,32 +98,66 @@ impl RealtimeSynth {
             .expect("failed to find output device");
         println!("Output device: {}", device.name().unwrap());
 
-        let config = device.default_output_config().unwrap();
+        let stream_config = device.default_output_config().unwrap();
 
-        RealtimeSynth::open(channel_count, &device, config)
+        RealtimeSynth::open(Default::default(), &device, stream_config)
     }
 
-    pub fn open(channel_count: u32, device: &Device, config: SupportedStreamConfig) -> Self {
-        let mut channels = Vec::new();
+    /// Initializes as new realtime synthesizer using a given config and
+    /// the default audio output.
+    ///
+    /// See the `XSynthRealtimeConfig` documentation for the available options.
+    pub fn open_with_default_output(config: XSynthRealtimeConfig) -> Self {
+        let host = cpal::default_host();
+
+        let device = host
+            .default_output_device()
+            .expect("failed to find output device");
+        println!("Output device: {}", device.name().unwrap());
+
+        let stream_config = device.default_output_config().unwrap();
+
+        RealtimeSynth::open(config, &device, stream_config)
+    }
+
+    /// Initializes a new realtime synthesizer using a given config and a
+    /// specified audio output device.
+    ///
+    /// See the `XSynthRealtimeConfig` documentation for the available options.
+    /// See the `cpal` crate documentation for the `device` and `stream_config` parameters.
+    pub fn open(
+        config: XSynthRealtimeConfig,
+        device: &Device,
+        stream_config: SupportedStreamConfig,
+    ) -> Self {
+        let mut channel_stats = Vec::new();
         let mut senders = Vec::new();
         let mut command_senders = Vec::new();
 
-        let sample_rate = config.sample_rate().0;
-        let audio_channels = config.channels();
+        let sample_rate = stream_config.sample_rate().0;
+        let stream_params = AudioStreamParams::new(sample_rate, stream_config.channels().into());
 
-        let use_threadpool = false;
-
-        let pool = if use_threadpool {
-            Some(Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap()))
-        } else {
-            None
+        let pool = match config.multithreading {
+            ThreadCount::None => None,
+            ThreadCount::Auto => Some(Arc::new(rayon::ThreadPoolBuilder::new().build().unwrap())),
+            ThreadCount::Manual(threads) => Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap(),
+            )),
         };
 
-        let (output_sender, output_receiver) = bounded::<Vec<f32>>(channel_count as usize);
+        let (output_sender, output_receiver) = bounded::<Vec<f32>>(config.channel_count as usize);
 
-        for _ in 0u32..channel_count {
-            let mut channel = VoiceChannel::new(sample_rate, audio_channels, pool.clone());
-            channels.push(channel.clone());
+        let mut thread_handles = vec![];
+
+        for _ in 0u32..(config.channel_count) {
+            let mut channel =
+                VoiceChannel::new(config.channel_init_options, stream_params, pool.clone());
+            let stats = channel.get_channel_stats();
+            channel_stats.push(stats);
+
             let (event_sender, event_receiver) = unbounded();
             senders.push(event_sender);
 
@@ -381,35 +166,47 @@ impl RealtimeSynth {
             command_senders.push(command_sender);
 
             let output_sender = output_sender.clone();
-            thread::spawn(move || loop {
-                channel.push_events_iter(event_receiver.try_iter());
-                let mut vec = match command_receiver.recv() {
-                    Ok(vec) => vec,
-                    Err(_) => break,
-                };
-                channel.push_events_iter(event_receiver.try_iter());
-                channel.read_samples(&mut vec);
-                output_sender.send(vec).unwrap();
-            });
+            let join_handle = thread::Builder::new()
+                .name("xsynth_channel_handler".to_string())
+                .spawn(move || loop {
+                    channel.push_events_iter(event_receiver.try_iter());
+                    let mut vec = match command_receiver.recv() {
+                        Ok(vec) => vec,
+                        Err(_) => break,
+                    };
+                    channel.push_events_iter(event_receiver.try_iter());
+                    channel.read_samples(&mut vec);
+                    output_sender.send(vec).unwrap();
+                })
+                .unwrap();
+
+            thread_handles.push(join_handle);
+        }
+
+        if config.channel_count >= 16 {
+            senders[9]
+                .send(ChannelEvent::Config(ChannelConfigEvent::SetPercussionMode(
+                    true,
+                )))
+                .unwrap();
         }
 
         let mut vec_cache: VecDeque<Vec<f32>> = VecDeque::new();
-        for _ in 0..channel_count {
+        for _ in 0..(config.channel_count) {
             vec_cache.push_front(Vec::new());
         }
 
         let stats = RealtimeSynthStats::new();
 
         let total_voice_count = stats.voice_count.clone();
-        let channel_stats = channels.iter().map(|c| c.get_channel_stats()).to_vec();
 
-        let render = FunctionAudioPipe::new(sample_rate, audio_channels, move |out| {
-            for i in 0..channel_count as usize {
+        let channel_count = config.channel_count;
+        let render = FunctionAudioPipe::new(stream_params, move |out| {
+            for sender in command_senders.iter() {
                 let mut buf = vec_cache.pop_front().unwrap();
                 prepapre_cache_vec(&mut buf, out.len(), 0.0);
 
-                let channel = &command_senders[i];
-                channel.send(buf).unwrap();
+                sender.send(buf).unwrap();
             }
 
             for _ in 0..channel_count {
@@ -424,47 +221,41 @@ impl RealtimeSynth {
 
         let buffered = Arc::new(Mutex::new(BufferedRenderer::new(
             render,
-            sample_rate,
-            audio_channels,
-            48,
+            stream_params,
+            (sample_rate as f64 * config.render_window_ms / 1000.0) as usize,
         )));
 
-        fn build_stream<T: Sample>(
+        fn build_stream<T: SizedSample + ConvertSample>(
             device: &Device,
-            config: SupportedStreamConfig,
+            stream_config: SupportedStreamConfig,
             buffered: Arc<Mutex<BufferedRenderer>>,
         ) -> Stream {
-            let err_fn = |err| eprintln!("an error occurred on stream: {}", err);
+            let err_fn = |err| eprintln!("an error occurred on stream: {err}");
             let mut output_vec = Vec::new();
 
-            let mut limiter = VolumeLimiter::new(config.channels());
+            let mut limiter = VolumeLimiter::new(stream_config.channels());
 
-            let stream = device
+            device
                 .build_output_stream(
-                    &config.into(),
+                    &stream_config.into(),
                     move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                        output_vec.reserve(data.len());
-                        for _ in 0..data.len() {
-                            output_vec.push(0.0);
-                        }
+                        output_vec.resize(data.len(), 0.0);
                         buffered.lock().unwrap().read(&mut output_vec);
-                        let mut i = 0;
-                        for s in limiter.limit_iter(output_vec.drain(0..)) {
-                            data[i] = Sample::from(&s);
-                            i += 1;
+                        for (i, s) in limiter.limit_iter(output_vec.drain(0..)).enumerate() {
+                            data[i] = ConvertSample::from_f32(s);
                         }
                     },
                     err_fn,
+                    None,
                 )
-                .unwrap();
-
-            stream
+                .unwrap()
         }
 
-        let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => build_stream::<f32>(&device, config, buffered.clone()),
-            cpal::SampleFormat::I16 => build_stream::<i16>(&device, config, buffered.clone()),
-            cpal::SampleFormat::U16 => build_stream::<u16>(&device, config, buffered.clone()),
+        let stream = match stream_config.sample_format() {
+            cpal::SampleFormat::F32 => build_stream::<f32>(device, stream_config, buffered.clone()),
+            cpal::SampleFormat::I16 => build_stream::<i16>(device, stream_config, buffered.clone()),
+            cpal::SampleFormat::U16 => build_stream::<u16>(device, stream_config, buffered.clone()),
+            _ => panic!("unsupported sample format"), // I hate when crates use #[non_exhaustive]
         };
 
         stream.play().unwrap();
@@ -472,39 +263,94 @@ impl RealtimeSynth {
         let max_nps = Arc::new(ReadWriteAtomicU64::new(10000));
 
         Self {
-            _channels: channels,
-            buffered_renderer: buffered,
+            data: Some(RealtimeSynthThreadSharedData {
+                buffered_renderer: buffered,
 
-            event_senders: RealtimeEventSender::new(senders, max_nps),
-            stream,
+                event_senders: RealtimeEventSender::new(senders, max_nps, config.ignore_range),
+                stream,
+            }),
+            join_handles: thread_handles,
+
             stats,
-            stream_params: AudioStreamParams::new(sample_rate, audio_channels),
+            stream_params,
         }
     }
 
+    /// Sends a SynthEvent to the realtime synthesizer.
+    ///
+    /// See the `SynthEvent` documentation for more information.
     pub fn send_event(&mut self, event: SynthEvent) {
-        self.event_senders.send_event(event);
+        let data = self.data.as_mut().unwrap();
+        data.event_senders.send_event(event);
     }
 
+    /// Returns the event sender of the realtime synthesizer.
+    ///
+    /// See the `RealtimeEventSender` documentation for more information
+    /// on how to use.
     pub fn get_senders(&self) -> RealtimeEventSender {
-        self.event_senders.clone()
+        let data = self.data.as_ref().unwrap();
+        data.event_senders.clone()
     }
 
+    /// Returns the statistics reader of the realtime synthesizer.
+    ///
+    /// See the `RealtimeSynthStatsReader` documentation for more information
+    /// on how to use.
     pub fn get_stats(&self) -> RealtimeSynthStatsReader {
-        let buffered_stats = self.buffered_renderer.lock().unwrap().get_buffer_stats();
+        let data = self.data.as_ref().unwrap();
+        let buffered_stats = data.buffered_renderer.lock().unwrap().get_buffer_stats();
 
         RealtimeSynthStatsReader::new(self.stats.clone(), buffered_stats)
     }
 
-    pub fn stream_params(&self) -> &AudioStreamParams {
-        &self.stream_params
+    /// Returns the stream parameters of the audio output device.
+    pub fn stream_params(&self) -> AudioStreamParams {
+        self.stream_params
     }
 
+    /// Pauses the playback of the audio output device.
     pub fn pause(&mut self) -> Result<(), PauseStreamError> {
-        self.stream.pause()
+        let data = self.data.as_mut().unwrap();
+        data.stream.pause()
     }
 
+    /// Resumes the playback of the audio output device.
     pub fn resume(&mut self) -> Result<(), PlayStreamError> {
-        self.stream.play()
+        let data = self.data.as_mut().unwrap();
+        data.stream.play()
+    }
+}
+
+impl Drop for RealtimeSynth {
+    fn drop(&mut self) {
+        let data = self.data.take().unwrap();
+        // data.stream.pause().unwrap();
+        drop(data);
+        for handle in self.join_handles.drain(..) {
+            handle.join().unwrap();
+        }
+    }
+}
+
+trait ConvertSample: SizedSample {
+    fn from_f32(s: f32) -> Self;
+}
+
+impl ConvertSample for f32 {
+    fn from_f32(s: f32) -> Self {
+        s
+    }
+}
+
+impl ConvertSample for i16 {
+    fn from_f32(s: f32) -> Self {
+        (s * i16::MAX as f32) as i16
+    }
+}
+
+impl ConvertSample for u16 {
+    fn from_f32(s: f32) -> Self {
+        ((s * u16::MAX as f32) as i32 + i16::MIN as i32) as u16
     }
 }

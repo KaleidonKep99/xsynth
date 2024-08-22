@@ -1,5 +1,7 @@
-mod buffered_renderer;
-pub use buffered_renderer::*;
+#![allow(clippy::let_and_return)]
+#![allow(non_local_definitions)]
+
+pub mod buffered_renderer;
 
 pub mod channel;
 
@@ -17,5 +19,4 @@ pub mod effects;
 
 pub mod helpers;
 
-mod threaded_ref_cell;
-use self::threaded_ref_cell::*;
+pub mod channel_group;
